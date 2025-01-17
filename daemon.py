@@ -1,49 +1,164 @@
 #!/usr/bin/env python3
-
-import time
 import json
+import time
 import subprocess
-import os
-import platform
-import requests
-from datetime import datetime
-import subprocess
-import re
 import threading
+import requests
+import platform
+import re
 from collections import defaultdict
 
 CONFIG_FILE = "config.json"
 
-def block_dns_traffic(dns_ip):
-    """Block unauthorized DNS traffic using iptables."""
+def load_config():
+    """Loads the configuration from config.json"""
+    with open(CONFIG_FILE, "r") as file:
+        return json.load(file)
+
+def send_telegram_message(message):
+    """Sends a notification to Telegram if enabled."""
+    config = load_config()
+    telegram = config.get("telegram", {})
+
+    if not telegram.get("enabled", False):
+        return
+
+    bot_token = telegram["bot_token"]
+    chat_id = telegram["chat_id"]
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": message})
+    except requests.RequestException as e:
+        print(f"❌ Failed to send Telegram message: {e}", flush=True)
+
+def is_dns_reachable(dns_ip):
+    """Checks if the DNS server is reachable using a simple ping."""
+    try:
+        subprocess.run(["ping", "-c", "1", dns_ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+def set_dns(dns_ip):
+    """Sets the system's DNS resolver."""
+    try:
+        subprocess.run(["sudo", "networksetup", "-setdnsservers", "Wi-Fi", dns_ip], check=True)
+        print(f"✅ Switched DNS to: {dns_ip}", flush=True)
+        send_telegram_message(f"🔄 Switched DNS to {dns_ip}")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to switch DNS: {e}", flush=True)
+
+def get_highest_priority_dns():
+    """Returns the highest-priority reachable DNS server."""
+    config = load_config()
+    dns_servers = sorted(config["dns_servers"], key=lambda x: -x["priority"])  # Sort by priority (descending)
+
+    for dns in dns_servers:
+        if is_dns_reachable(dns["address"]):
+            return dns["address"]
+    return None
+def unblock_dns_traffic(dns_ip):
+    """Unblocks the DNS server by removing its block rule."""
+    system_type = platform.system().lower()
+
+    if system_type == "linux":
+        unblock_dns_linux(dns_ip)
+    elif system_type == "darwin":  # macOS
+        unblock_dns_macos(dns_ip)
+    else:
+        print(f"⚠️ Unsupported OS: {system_type}. Cannot unblock DNS.", flush=True)
+
+def unblock_dns_linux(dns_ip):
+    """Unblocks DNS using iptables on Linux."""
+    try:
+        subprocess.run(["sudo", "iptables", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-d", dns_ip, "-j", "DROP"], check=True)
+        subprocess.run(["sudo", "iptables", "-D", "OUTPUT", "-p", "tcp", "--dport", "53", "-d", dns_ip, "-j", "DROP"], check=True)
+        print(f"✅ Unblocked DNS (Linux): {dns_ip}", flush=True)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to unblock DNS on Linux: {e}", flush=True)
+
+def unblock_dns_macos(dns_ip):
+    """Unblocks DNS using PF on macOS."""
+    pf_rule = f"pass out proto udp to {dns_ip} port 53\npass out proto tcp to {dns_ip} port 53\n"
+    
+    try:
+        command = f"echo '{pf_rule}' | cat /etc/pf.conf - | sudo /sbin/pfctl -Ef -"
+        subprocess.run(command, shell=True, check=True)
+        print(f"✅ Unblocked DNS (macOS) via pf: {dns_ip}", flush=True)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to unblock DNS on macOS: {e}", flush=True)
+
+def block_dns_traffic(dns_ip, duration):
+    """Blocks unauthorized DNS traffic using the appropriate method for the OS."""
+    system_type = platform.system().lower()
+
+    if system_type == "linux":
+        block_dns_linux(dns_ip, duration)
+    elif system_type == "darwin":  # macOS
+        block_dns_macos(dns_ip, duration)
+    else:
+        print(f"⚠️ Unsupported OS: {system_type}. Cannot block DNS.", flush=True)
+
+def block_dns_linux(dns_ip, block_duration):
+    """Blocks DNS using iptables on Linux."""
     try:
         subprocess.run(["sudo", "iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-d", dns_ip, "-j", "DROP"], check=True)
-        print(f"🚫 Blocked unauthorized DNS server: {dns_ip}")
-        send_telegram_message(f"🚨 DNS Leak Prevented: Blocked {dns_ip}")
+        subprocess.run(["sudo", "iptables", "-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-d", dns_ip, "-j", "DROP"], check=True)
+        print(f"🚫 Blocked unauthorized DNS (Linux): {dns_ip}", flush=True)
+        threading.Timer(block_duration, unblock_dns_traffic, args=[dns_ip]).start()
+
     except subprocess.CalledProcessError as e:
-        print(f"Failed to block DNS: {e}")
+        print(f"❌ Failed to block DNS on Linux: {e}", flush=True)
+
+def block_dns_macos(dns_ip, block_duration):
+    """Blocks DNS using PF anchors on macOS."""
+    anchor_name = "com.example.dnsblocker"
+    "echo 'block out all' | cat /etc/pf.conf - | sudo /sbin/pfctl -Ef -"
+    pf_rule = f"block drop out proto udp to {dns_ip} port 53\nblock drop out proto tcp to {dns_ip} port 53\n"
+
+    try:
+        command = f"echo '{pf_rule}' | cat /etc/pf.conf - | sudo /sbin/pfctl -Ef -"
+        subprocess.run(command, shell=True, check=True)
+        threading.Timer(block_duration, unblock_dns_traffic, args=[dns_ip]).start()
+        print(f"🚫 Blocked unauthorized DNS (macOS): {dns_ip}", flush=True)
+    except Exception as e:
+        print(f"❌ Failed to block DNS on macOS: {e}", flush=True)
+
+def unblock_all_dns():
+    """Removes all DNS blocking rules (useful for testing)."""
+    system_type = platform.system().lower()
+
+    if system_type == "linux":
+        subprocess.run(["sudo", "iptables", "-F"], check=True)
+        print("✅ Flushed iptables rules (Linux).", flush=True)
+    elif system_type == "darwin":
+        subprocess.run(["sudo", "/sbin/pfctl", "-F", "all"], check=True)
+        subprocess.run(["sudo", "/sbin/pfctl", "-d"], check=True)
+        print("✅ Flushed PF rules (macOS).", flush=True)
+    else:
+        print(f"⚠️ Unsupported OS: {system_type}. Cannot unblock DNS.", flush=True)
 
 
 def monitor_dns_leaks():
     """Monitors DNS traffic and blocks unauthorized DNS requests."""
     config = load_config()
     leak_config = config.get("leak_prevention", {})
-
     if not leak_config.get("enabled", False):
         return
 
-    interface = leak_config.get("interface", "eth0")
-    allowed_dns = set(config["dns_servers"])
+    interface = leak_config.get("interface", "en0")  # Default to macOS "en0"
+    allowed_dns = {dns["address"] for dns in config["dns_servers"]}
     alert_threshold = leak_config.get("alert_threshold", 3)
     enable_blocking = leak_config.get("iptables_blocking", False)
-
+    block_duration = leak_config.get("block_duration", 3600)
     suspicious_requests = defaultdict(int)
 
-    print(f"Monitoring DNS traffic on {interface}...")
+    print(f"👀 Monitoring DNS traffic on {interface}...", flush=True)
 
     try:
         process = subprocess.Popen(
-            ["tcpdump", "-l", "-n", "-i", interface, "udp port 53"],
+            ["sudo", "/usr/sbin/tcpdump", "-l", "-n", "-i", interface, "udp port 53"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True
@@ -56,140 +171,36 @@ def monitor_dns_leaks():
 
                 if dns_ip not in allowed_dns:
                     suspicious_requests[dns_ip] += 1
-                    print(f"⚠️ Potential DNS leak: {dns_ip} (count: {suspicious_requests[dns_ip]})")
+                    print(f"⚠️ Potential DNS leak: {dns_ip} (count: {suspicious_requests[dns_ip]})", flush=True)
 
                     if suspicious_requests[dns_ip] >= alert_threshold:
                         send_telegram_message(f"🚨 DNS Leak Detected! Unauthorized request to {dns_ip}")
                         if enable_blocking:
-                            block_dns_traffic(dns_ip)
+                            block_dns_traffic(dns_ip, block_duration)
+                            suspicious_requests[dns_ip] = 0  # Reset counter after blocking
     
     except Exception as e:
-        print(f"Error monitoring DNS traffic: {e}")
-
-def send_telegram_message(message):
-    """Sends a notification to Telegram if enabled."""
-    config = load_config()
-    telegram_config = config.get("telegram", {})
-
-    if not telegram_config.get("enabled", False):
-        return
-
-    bot_token = telegram_config.get("bot_token")
-    chat_id = telegram_config.get("chat_id")
-
-    if not bot_token or not chat_id:
-        print("Telegram bot token or chat ID missing in config.")
-        return
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = {"chat_id": chat_id, "text": message}
-
-    try:
-        response = requests.post(url, json=data)
-        if response.status_code != 200:
-            print(f"Failed to send Telegram message: {response.text}")
-    except Exception as e:
-        print(f"Error sending Telegram message: {e}")
-
-
-def load_config():
-    """Loads configuration from the JSON file."""
-    default_config = {
-        "dns_servers": [
-            {"address": "1.1.1.1", "priority": 1},
-            {"address": "8.8.8.8", "priority": 2},
-            {"address": "127.0.0.1", "priority": 3}
-        ],
-        "check_interval": 15  # Time (seconds) between checks
-    }
-
-    if not os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(default_config, f, indent=4)
-        return default_config
-
-    with open(CONFIG_FILE, "r") as f:
-        return json.load(f)
-
-def get_os():
-    """Returns the operating system."""
-    return platform.system().lower()
-
-def get_current_dns():
-    """Gets the current DNS settings based on the OS."""
-    os_type = get_os()
-
-    try:
-        if os_type == "darwin":  # macOS
-            result = subprocess.run(["networksetup", "-getdnsservers", "Wi-Fi"], capture_output=True, text=True)
-            return result.stdout.strip().split("\n")[0]
-
-        elif os_type == "linux":
-            with open("/etc/resolv.conf", "r") as f:
-                for line in f:
-                    if line.startswith("nameserver"):
-                        return line.split()[1]
-        
-        elif os_type == "windows":
-            result = subprocess.run(["nslookup", "example.com"], capture_output=True, text=True, shell=True)
-            lines = result.stdout.split("\n")
-            for line in lines:
-                if "Address" in line:
-                    return line.split(":")[-1].strip()
-    
-    except Exception as e:
-        print(f"Error getting DNS: {e}")
-    
-    return "Unknown"
-
-def set_dns(dns):
-    """Sets the DNS server based on the OS."""
-    os_type = get_os()
-
-    try:
-        if os_type == "darwin":  # macOS
-            subprocess.run(["sudo", "/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", dns], check=True)
-
-        elif os_type == "linux":
-            with open("/etc/resolv.conf", "w") as f:
-                f.write(f"nameserver {dns}\n")
-
-        elif os_type == "windows":
-            subprocess.run(f'netsh interface ip set dns "Wi-Fi" static {dns}', shell=True)
-
-        print(f"{datetime.now()} - Switched to DNS: {dns}", flush=True)
-
-    except subprocess.CalledProcessError as e:
-        print(f"{datetime.now()} - Failed to set DNS: {e}", flush=True)
-
-def is_dns_reachable(dns):
-    """Checks if a DNS server is reachable via ping."""
-    try:
-        result = subprocess.run(["ping", "-c", "1", "-W", "1", dns], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
-    except Exception as e:
-        print(f"{datetime.now()} - Ping error: {e}", flush=True)
-        return False
+        print(f"❌ Error monitoring DNS traffic: {e}", flush=True)
 
 def main():
-    """Main daemon loop."""
+    """Main daemon loop for DNS switching."""
     config = load_config()
-    dns_servers = sorted(config["dns_servers"], key=lambda x: x["priority"])
     check_interval = config["check_interval"]
-    send_telegram_message("🚀 DNS Switcher Daemon Started!")
+    last_dns = None
+
+    # Start DNS leak monitoring in a separate thread
     threading.Thread(target=monitor_dns_leaks, daemon=True).start()
+
     while True:
-        for dns_entry in dns_servers:
-            dns = dns_entry["address"]
-            if is_dns_reachable(dns):
-                if get_current_dns() != dns:
-                    send_telegram_message(f"🔔 DNS switched to {dns}")
-                    print(f"{datetime.now()} - Switching to DNS: {dns}", flush=True)
-                    set_dns(dns)
-                break  # Stop checking once a valid DNS is found
-        else:
-            print("No DNS server is reachable, trying again...")
+        best_dns = get_highest_priority_dns()
+        
+        if best_dns and best_dns != last_dns:
+            set_dns(best_dns)
+            last_dns = best_dns
+
+        if not best_dns:
             send_telegram_message("⚠️ No DNS server is reachable!")
+
         time.sleep(check_interval)
 
 if __name__ == "__main__":
