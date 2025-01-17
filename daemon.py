@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 
 CONFIG_FILE = "config.json"
-
+CURRENT_DNS_RATINGS = {}
 def load_config():
     """Loads the configuration from config.json"""
     with open(CONFIG_FILE, "r") as file:
@@ -49,15 +49,43 @@ def set_dns(dns_ip):
     except subprocess.CalledProcessError as e:
         print(f"❌ Failed to switch DNS: {e}", flush=True)
 
+def get_ping_time(dns_ip):
+    """Returns the ping time to the DNS server in milliseconds."""
+    try:
+        output = subprocess.check_output(["ping", "-c", "1", dns_ip], stderr=subprocess.STDOUT, text=True)
+        match = re.search(r"time=(\d+\.\d+) ms", output)
+        return float(match.group(1)) if match else float("inf")
+    except subprocess.CalledProcessError:
+        return float("inf")
+
+def calculate_dns_ratings(dns_servers):
+    """Calculates ratings for DNS servers based on their ping times."""
+    dns_ratings = {}
+    threads = []
+    results = {}
+
+    def ping_dns(dns):
+        results[dns["address"]] = get_ping_time(dns["address"])
+
+    for dns in dns_servers:
+        thread = threading.Thread(target=ping_dns, args=(dns,))
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    for dns in dns_servers:
+        dns_ratings[dns["address"]] = (results[dns["address"]]) * (10 ** (2 * dns["priority"]))
+    CURRENT_DNS_RATINGS = dns_ratings.copy()    
+    return dns_ratings
+
 def get_highest_priority_dns():
     """Returns the highest-priority reachable DNS server."""
     config = load_config()
-    dns_servers = sorted(config["dns_servers"], key=lambda x: -x["priority"])  # Sort by priority (descending)
-
-    for dns in dns_servers:
-        if is_dns_reachable(dns["address"]):
-            return dns["address"]
-    return None
+    dns_servers = sorted(config["dns_servers"], key=lambda x: x["priority"])  # Sort by priority (ascending)
+    dns_server_ratings = calculate_dns_ratings(dns_servers)
+    return min(dns_server_ratings, key=dns_server_ratings.get, default=None)
 def unblock_dns_traffic(dns_ip):
     """Unblocks the DNS server by removing its block rule."""
     system_type = platform.system().lower()
@@ -178,7 +206,6 @@ def monitor_dns_leaks():
                         if enable_blocking:
                             block_dns_traffic(dns_ip, block_duration)
                             suspicious_requests[dns_ip] = 0  # Reset counter after blocking
-    
     except Exception as e:
         print(f"❌ Error monitoring DNS traffic: {e}", flush=True)
 
@@ -190,7 +217,6 @@ def main():
 
     # Start DNS leak monitoring in a separate thread
     threading.Thread(target=monitor_dns_leaks, daemon=True).start()
-
     while True:
         best_dns = get_highest_priority_dns()
         
