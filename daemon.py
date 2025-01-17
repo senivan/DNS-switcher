@@ -1,8 +1,11 @@
+#!/usr/bin/env python3
+
 import time
 import json
 import subprocess
 import os
 import platform
+from datetime import datetime
 
 CONFIG_FILE = "config.json"
 
@@ -71,10 +74,10 @@ def set_dns(dns):
         elif os_type == "windows":
             subprocess.run(f'netsh interface ip set dns "Wi-Fi" static {dns}', shell=True)
 
-        print(f"Switched to DNS: {dns}")
+        print(f"{datetime.now()} - Switched to DNS: {dns}")
 
     except subprocess.CalledProcessError as e:
-        print(f"Failed to set DNS: {e}")
+        print(f"{datetime.now()} - Failed to set DNS: {e}")
 
 def is_dns_reachable(dns):
     """Checks if a DNS server is reachable via ping."""
@@ -82,7 +85,7 @@ def is_dns_reachable(dns):
         result = subprocess.run(["ping", "-c", "1", "-W", "1", dns], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return result.returncode == 0
     except Exception as e:
-        print(f"Ping error: {e}")
+        print(f"{datetime.now()} - Ping error: {e}")
         return False
 
 def main():
@@ -96,7 +99,7 @@ def main():
             dns = dns_entry["address"]
             if is_dns_reachable(dns):
                 if get_current_dns() != dns:
-                    print(f"Switching to DNS: {dns}")
+                    print(f"{datetime.now()} - Switching to DNS: {dns}")
                     set_dns(dns)
                 break  # Stop checking once a valid DNS is found
 
