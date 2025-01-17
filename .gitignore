@@ -121,3 +121,4 @@ dmypy.json
 cython_debug/
 
 .__config.json
+_daemon.py
