@@ -5,9 +5,92 @@ import json
 import subprocess
 import os
 import platform
+import requests
 from datetime import datetime
+import subprocess
+import re
+import threading
+from collections import defaultdict
 
 CONFIG_FILE = "config.json"
+
+def block_dns_traffic(dns_ip):
+    """Block unauthorized DNS traffic using iptables."""
+    try:
+        subprocess.run(["sudo", "iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-d", dns_ip, "-j", "DROP"], check=True)
+        print(f"🚫 Blocked unauthorized DNS server: {dns_ip}")
+        send_telegram_message(f"🚨 DNS Leak Prevented: Blocked {dns_ip}")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to block DNS: {e}")
+
+
+def monitor_dns_leaks():
+    """Monitors DNS traffic and blocks unauthorized DNS requests."""
+    config = load_config()
+    leak_config = config.get("leak_prevention", {})
+
+    if not leak_config.get("enabled", False):
+        return
+
+    interface = leak_config.get("interface", "eth0")
+    allowed_dns = set(config["dns_servers"])
+    alert_threshold = leak_config.get("alert_threshold", 3)
+    enable_blocking = leak_config.get("iptables_blocking", False)
+
+    suspicious_requests = defaultdict(int)
+
+    print(f"Monitoring DNS traffic on {interface}...")
+
+    try:
+        process = subprocess.Popen(
+            ["tcpdump", "-l", "-n", "-i", interface, "udp port 53"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+
+        for line in iter(process.stdout.readline, ""):
+            match = re.search(r"IP .*? > (\d+\.\d+\.\d+\.\d+)\.53:", line)
+            if match:
+                dns_ip = match.group(1)
+
+                if dns_ip not in allowed_dns:
+                    suspicious_requests[dns_ip] += 1
+                    print(f"⚠️ Potential DNS leak: {dns_ip} (count: {suspicious_requests[dns_ip]})")
+
+                    if suspicious_requests[dns_ip] >= alert_threshold:
+                        send_telegram_message(f"🚨 DNS Leak Detected! Unauthorized request to {dns_ip}")
+                        if enable_blocking:
+                            block_dns_traffic(dns_ip)
+    
+    except Exception as e:
+        print(f"Error monitoring DNS traffic: {e}")
+
+def send_telegram_message(message):
+    """Sends a notification to Telegram if enabled."""
+    config = load_config()
+    telegram_config = config.get("telegram", {})
+
+    if not telegram_config.get("enabled", False):
+        return
+
+    bot_token = telegram_config.get("bot_token")
+    chat_id = telegram_config.get("chat_id")
+
+    if not bot_token or not chat_id:
+        print("Telegram bot token or chat ID missing in config.")
+        return
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = {"chat_id": chat_id, "text": message}
+
+    try:
+        response = requests.post(url, json=data)
+        if response.status_code != 200:
+            print(f"Failed to send Telegram message: {response.text}")
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
 
 def load_config():
     """Loads configuration from the JSON file."""
@@ -93,16 +176,20 @@ def main():
     config = load_config()
     dns_servers = sorted(config["dns_servers"], key=lambda x: x["priority"])
     check_interval = config["check_interval"]
-
+    send_telegram_message("🚀 DNS Switcher Daemon Started!")
+    threading.Thread(target=monitor_dns_leaks, daemon=True).start()
     while True:
         for dns_entry in dns_servers:
             dns = dns_entry["address"]
             if is_dns_reachable(dns):
                 if get_current_dns() != dns:
+                    send_telegram_message(f"🔔 DNS switched to {dns}")
                     print(f"{datetime.now()} - Switching to DNS: {dns}", flush=True)
                     set_dns(dns)
                 break  # Stop checking once a valid DNS is found
-
+        else:
+            print("No DNS server is reachable, trying again...")
+            send_telegram_message("⚠️ No DNS server is reachable!")
         time.sleep(check_interval)
 
 if __name__ == "__main__":
